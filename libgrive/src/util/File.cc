@@ -33,6 +33,10 @@
 #include <sys/types.h>
 #include <fcntl.h>
 
+#if defined(__FreeBSD__) || defined(__OpenBSD__)
+#include <unistd.h>
+#endif
+
 #ifdef WIN32
 	#include <io.h>
 	typedef int ssize_t ;

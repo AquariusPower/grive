@@ -28,21 +28,34 @@
 #include "util/log/Log.hh"
 #include "json/JsonParser.hh"
 
+#include <boost/algorithm/string.hpp>
+
 #include <fstream>
 
 namespace gr {
 
-State::State( const fs::path& filename, const Val& options  ) :
+const std::string state_file = ".grive_state" ;
+const std::string ignore_file = ".griveignore" ;
+const int MAX_IGN = 65536 ;
+const char* regex_escape_chars = ".^$|()[]{}*+?\\";
+const boost::regex regex_escape_re( "[.^$|()\\[\\]{}*+?\\\\]" );
+
+inline std::string regex_escape( std::string s )
+{
+	return regex_replace( s, regex_escape_re, "\\\\&", boost::format_sed );
+}
+
+State::State( const fs::path& root, const Val& options  ) :
+	m_root		( root ),
 	m_res		( options["path"].Str() ),
 	m_cstamp	( -1 )
 {
-	Read( filename ) ;
-	
+	Read() ;
+
 	// the "-f" option will make grive always think remote is newer
 	m_force = options.Has( "force" ) ? options["force"].Bool() : false ;
-	
+
 	std::string m_orig_ign = m_ign;
-	m_ign = "";
 	if ( options.Has( "ignore" ) && options["ignore"].Str() != m_ign )
 		m_ign = options["ignore"].Str();
 	else if ( options.Has( "dir" ) )
@@ -52,8 +65,7 @@ State::State( const fs::path& filename, const Val& options  ) :
 		if ( !m_dir.empty() )
 		{
 			// "-s" is internally converted to an ignore regexp
-			const boost::regex esc( "[.^$|()\\[\\]{}*+?\\\\]" );
-			m_dir = regex_replace( m_dir, esc, "\\\\&", boost::format_sed );
+			m_dir = regex_escape( m_dir );
 			size_t pos = 0;
 			while ( ( pos = m_dir.find( '/', pos ) ) != std::string::npos )
 			{
@@ -66,7 +78,7 @@ State::State( const fs::path& filename, const Val& options  ) :
 	}
 
 	m_ign_changed = m_orig_ign != "" && m_orig_ign != m_ign;
-	m_ign_re = boost::regex( m_ign.empty() ? "^\\.(grive|grive_state|trash)" : ( m_ign+"|^\\.(grive|grive_state|trash)" ) );
+	m_ign_re = boost::regex( m_ign.empty() ? "^\\.(grive$|grive_state$|trash)" : ( m_ign+"|^\\.(grive$|grive_state$|trash)" ) );
 }
 
 State::~State()
@@ -83,7 +95,7 @@ void State::FromLocal( const fs::path& p )
 
 bool State::IsIgnore( const std::string& filename )
 {
-	return regex_search( filename.c_str(), m_ign_re );
+	return regex_search( filename.c_str(), m_ign_re, boost::format_perl );
 }
 
 void State::FromLocal( const fs::path& p, Resource* folder, Val& tree )
@@ -96,7 +108,7 @@ void State::FromLocal( const fs::path& p, Resource* folder, Val& tree )
 	for ( fs::directory_iterator i( p ) ; i != fs::directory_iterator() ; ++i )
 	{
 		std::string fname = i->path().filename().string() ;
-		std::string path = folder->IsRoot() ? fname : ( folder->RelPath() / fname ).string();
+		std::string path = ( folder->IsRoot() ? fname : ( folder->RelPath() / fname ).string() );
 		
 		if ( IsIgnore( path ) )
 			Log( "file %1% is ignored by grive", path, log::verbose ) ;
@@ -130,7 +142,7 @@ void State::FromLocal( const fs::path& p, Resource* folder, Val& tree )
 		else
 		{
 			// Restore state of locally deleted files
-			Resource *c = folder->FindChild( i->first ), *c2 ;
+			Resource *c = folder->FindChild( i->first ), *c2 = c ;
 			if ( !c )
 			{
 				c2 = new Resource( i->first, i->second.Has( "tree" ) ? "folder" : "file" ) ;
@@ -225,6 +237,12 @@ bool State::Update( const Entry& e )
 	}
 	else if ( Resource *parent = m_res.FindByHref( e.ParentHref() ) )
 	{
+		if ( !parent->IsFolder() )
+		{
+			// https://github.com/vitalif/grive2/issues/148
+			Log( "%1% is owned by something that's not a directory: href=%2% name=%3%", e.Name(), e.ParentHref(), parent->RelPath(), log::error );
+			return true;
+		}
 		assert( parent->IsFolder() ) ;
 
 		std::string path = parent->IsRoot() ? e.Name() : ( parent->RelPath() / e.Name() ).string();
@@ -277,27 +295,118 @@ State::iterator State::end()
 	return m_res.end() ;
 }
 
-void State::Read( const fs::path& filename )
+void State::Read()
 {
 	try
 	{
-		File file( filename ) ;
-
-		m_st = ParseJson( file );
-		m_ign = m_st.Has( "ignore_regexp" ) ? m_st["ignore_regexp"].Str() : std::string();
-
+		File st_file( m_root / state_file ) ;
+		m_st = ParseJson( st_file );
 		m_cstamp = m_st["change_stamp"].Int() ;
 	}
 	catch ( Exception& )
 	{
 	}
+
+	try
+	{
+		File ign_file( m_root / ignore_file ) ;
+		char ign[MAX_IGN] = { 0 };
+		int s = ign_file.Read( ign, MAX_IGN-1 ) ;
+		ParseIgnoreFile( ign, s );
+	}
+	catch ( Exception& e )
+	{
+	}
 }
 
-void State::Write( const fs::path& filename )
+std::vector<std::string> split( const boost::regex& re, const char* str, int len )
+{
+	std::vector<std::string> vec;
+	boost::cregex_token_iterator i( str, str+len, re, -1, boost::format_perl );
+	boost::cregex_token_iterator j;
+	while ( i != j )
+	{
+		vec.push_back( *i++ );
+	}
+	return vec;
+}
+
+bool State::ParseIgnoreFile( const char* buffer, int size )
+{
+	const boost::regex re1( "([^\\\\]|^)[\\t\\r ]+$" );
+	const boost::regex re2( "^[\\t\\r ]+" );
+	const boost::regex re4( "([^\\\\](\\\\\\\\)*|^)\\\\\\*" );
+	const boost::regex re5( "([^\\\\](\\\\\\\\)*|^)\\\\\\?" );
+	std::string exclude_re, include_re;
+	std::vector<std::string> lines = split( boost::regex( "[\\n\\r]+" ), buffer, size );
+	for ( int i = 0; i < (int)lines.size(); i++ )
+	{
+		std::string str = regex_replace( regex_replace( lines[i], re1, "$1" ), re2, "" );
+		if ( str[0] == '#' || !str.size() )
+		{
+			continue;
+		}
+		bool inc = str[0] == '!';
+		if ( inc )
+		{
+			str = str.substr( 1 );
+		}
+		std::vector<std::string> parts = split( boost::regex( "/+" ), str.c_str(), str.size() );
+		for ( int j = 0; j < (int)parts.size(); j++ )
+		{
+			if ( parts[j] == "**" )
+			{
+				parts[j] = ".*";
+			}
+			else if ( parts[j] == "*" )
+			{
+				parts[j] = "[^/]*";
+			}
+			else
+			{
+				parts[j] = regex_escape( parts[j] );
+				std::string str1;
+				while (1)
+				{
+					str1 = regex_replace( parts[j], re5, "$1[^/]", boost::format_perl );
+					str1 = regex_replace( str1, re4, "$1[^/]*", boost::format_perl );
+					if ( str1.size() == parts[j].size() )
+						break;
+					parts[j] = str1;
+				}
+			}
+		}
+		if ( !inc )
+		{
+			str = boost::algorithm::join( parts, "/" ) + "(/|$)";
+			exclude_re = exclude_re + ( exclude_re.size() > 0 ? "|" : "" ) + str;
+		}
+		else
+		{
+			str = "";
+			std::string cur;
+			for ( int j = 0; j < (int)parts.size(); j++ )
+			{
+				cur = cur.size() > 0 ? cur + "/" + parts[j] : "^" + parts[j];
+				str = ( str.size() > 0 ? str + "|" + cur : cur ) + ( j < (int)parts.size()-1 ? "$" : "(/|$)" );
+			}
+			include_re = include_re + ( include_re.size() > 0 ? "|" : "" ) + str;
+		}
+	}
+	if ( exclude_re.size() > 0 )
+	{
+		m_ign = "^" + ( include_re.size() > 0 ? "(?!" + include_re + ")" : std::string() ) + "(" + exclude_re + ")$";
+		return true;
+	}
+	return false;
+}
+
+void State::Write()
 {
 	m_st.Set( "change_stamp", Val( m_cstamp ) ) ;
 	m_st.Set( "ignore_regexp", Val( m_ign ) ) ;
 	
+	fs::path filename = m_root / state_file ;
 	std::ofstream fs( filename.string().c_str() ) ;
 	fs << m_st ;
 }

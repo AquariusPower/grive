@@ -46,8 +46,8 @@
 #include <iostream>
 #include <unistd.h>
 
-const std::string client_id		= "22314510474.apps.googleusercontent.com" ;
-const std::string client_secret	= "bl4ufi89h-9MkFlypcI7R785" ;
+const std::string default_id            = "22314510474.apps.googleusercontent.com" ;
+const std::string default_secret        = "bl4ufi89h-9MkFlypcI7R785" ;
 
 using namespace gr ;
 namespace po = boost::program_options;
@@ -111,6 +111,8 @@ int Main( int argc, char **argv )
 		( "help,h",		"Produce help message" )
 		( "version,v",	"Display Grive version" )
 		( "auth,a",		"Request authorization token" )
+                ( "id,i",               po::value<std::string>(), "Authentication ID")
+                ( "secret,e",           po::value<std::string>(), "Authentication secret")
 		( "path,p",		po::value<std::string>(), "Path to working copy root")
 		( "dir,s",		po::value<std::string>(), "Single subdirectory to sync")
 		( "verbose,V",	"Verbose mode. Enable more messages than normal.")
@@ -124,15 +126,22 @@ int Main( int argc, char **argv )
 		( "no-remote-new,n", "Download only files that are changed in Google Drive and already exist locally" )
 		( "dry-run",	"Only detect which files need to be uploaded/downloaded, "
 						"without actually performing them." )
-		( "ignore",		po::value<std::string>(), "Perl RegExp to ignore files (matched against relative paths)." )
 		( "upload-speed,U", po::value<unsigned>(), "Limit upload speed in kbytes per second" )
 		( "download-speed,D", po::value<unsigned>(), "Limit download speed in kbytes per second" )
 		( "progress-bar,P", "Enable progress bar for upload/download of files")
 	;
 	
 	po::variables_map vm;
-	po::store(po::parse_command_line( argc, argv, desc), vm );
-	po::notify(vm);
+	try
+	{
+		po::store( po::parse_command_line( argc, argv, desc ), vm );
+	}
+	catch( po::error &e )
+	{
+		std::cerr << "Options are incorrect. Use -h for help\n";
+		return -1;
+	}
+	po::notify( vm );
 	
 	// simple commands that doesn't require log or config
 	if ( vm.count("help") )
@@ -148,9 +157,9 @@ int Main( int argc, char **argv )
 	}
 
 	// initialize logging
-	InitLog(vm) ;
+	InitLog( vm ) ;
 	
-	Config config(vm) ;
+	Config config( vm ) ;
 	
 	Log( "config file name %1%", config.Filename(), log::verbose );
 
@@ -165,9 +174,22 @@ int Main( int argc, char **argv )
 		http->SetProgressReporter( pb.get() );
 	}
 
+	std::string id = default_id;
+	std::string secret = default_secret;
+
+	if( vm.count( "id" ) )
+	{
+		id = vm["id"].as<std::string>();
+	}
+
+	if( vm.count( "secret" ) )
+	{
+		secret = vm["secret"].as<std::string>();
+	}
+
 	if ( vm.count( "auth" ) )
 	{
-		OAuth2 token( http.get(), client_id, client_secret ) ;
+		OAuth2 token( http.get(), id, secret ) ;
 		
 		std::cout
 			<< "-----------------------\n"
@@ -203,7 +225,7 @@ int Main( int argc, char **argv )
 		return -1;
 	}
 	
-	OAuth2 token( http.get(), refresh_token, client_id, client_secret ) ;
+	OAuth2 token( http.get(), refresh_token, id, secret ) ;
 	AuthAgent agent( token, http.get() ) ;
 	v2::Syncer2 syncer( &agent );
 
